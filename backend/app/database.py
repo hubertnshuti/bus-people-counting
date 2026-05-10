@@ -2,7 +2,10 @@ import sqlite3
 import datetime
 import os
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "bus.db")
+DB_PATH = os.environ.get(
+    "BUS_DB_PATH",
+    os.path.join(os.path.dirname(__file__), "..", "data", "bus.db"),
+)
 
 
 def get_db():
