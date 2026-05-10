@@ -10,6 +10,30 @@ st.set_page_config(page_title="Bus Counter", page_icon="🚌", layout="wide")
 DB_PATH     = os.path.join(os.path.dirname(__file__), "..", "backend", "data", "bus.db")
 SERVER_BASE = "http://localhost:8000"
 
+st.markdown("""
+<style>
+.capacity-wrap { margin: 18px 0 24px 0; }
+.capacity-label {
+    display: flex; justify-content: space-between;
+    font-size: 14px; color: #6b7280; margin-bottom: 8px;
+    font-feature-settings: "tnum";
+}
+.capacity-label .left  { font-weight: 500; color: #374151; }
+.capacity-label .right { font-weight: 600; color: #111827; }
+.capacity-bar {
+    height: 28px; background: #f3f4f6; border-radius: 14px;
+    overflow: hidden; border: 1px solid #e5e7eb;
+}
+.capacity-fill {
+    height: 100%; border-radius: 14px;
+    transition: width 0.6s cubic-bezier(.4,0,.2,1), background 0.4s ease;
+}
+.capacity-fill.normal   { background: linear-gradient(90deg, #10b981 0%, #059669 100%); }
+.capacity-fill.elevated { background: linear-gradient(90deg, #f59e0b 0%, #d97706 100%); }
+.capacity-fill.critical { background: linear-gradient(90deg, #ef4444 0%, #dc2626 100%); }
+</style>
+""", unsafe_allow_html=True)
+
 
 def load_events():
     if not os.path.exists(DB_PATH):
@@ -51,7 +75,6 @@ def update_device_state(payload):
         return False
 
 
-# Sidebar
 state = get_device_state_fresh()
 with st.sidebar:
     st.markdown("### Controls")
@@ -84,10 +107,10 @@ def live_metrics():
     if live.empty:
         current_count, total_entries, total_exits, seconds_since = 0, 0, 0, 999
     else:
-        current_count  = int(live.iloc[-1]["count_after"])
-        total_entries  = int((live["event_type"] == "entry").sum())
-        total_exits    = int((live["event_type"] == "exit").sum())
-        seconds_since  = (pd.Timestamp.now() - live.iloc[-1]["server_time"]).total_seconds()
+        current_count = int(live.iloc[-1]["count_after"])
+        total_entries = int((live["event_type"] == "entry").sum())
+        total_exits   = int((live["event_type"] == "exit").sum())
+        seconds_since = (pd.Timestamp.now() - live.iloc[-1]["server_time"]).total_seconds()
 
     col1, col2, col3, col4 = st.columns(4)
     with col1: st.metric("People on bus", f"{current_count} / {bus_cap}")
@@ -98,6 +121,20 @@ def live_metrics():
         elif seconds_since < 120: status = "Quiet"
         else:                     status = "No signal"
         st.metric("Device", status, f"{int(seconds_since)}s ago")
+
+    pct = min(100, (current_count / bus_cap) * 100) if bus_cap else 0
+    bar_class = "normal" if pct < 60 else ("elevated" if pct < 90 else "critical")
+    st.markdown(f"""
+    <div class='capacity-wrap'>
+      <div class='capacity-label'>
+        <span class='left'>Current capacity</span>
+        <span class='right'>{current_count} / {bus_cap} &nbsp;·&nbsp; {pct:.0f}%</span>
+      </div>
+      <div class='capacity-bar'>
+        <div class='capacity-fill {bar_class}' style='width: {pct}%;'></div>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
 
 
 @st.fragment(run_every=5)
