@@ -2,6 +2,11 @@
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 #include <Preferences.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
 #include "config.h"
 
 #define SENSOR_A_TRIG  17
@@ -22,7 +27,11 @@ static const unsigned long INTER_SENSOR_GAP_US     = 1500;
 static const unsigned long PULSE_TIMEOUT_US        = 5000;
 static const unsigned long PASSAGE_MAX_DURATION_MS = 5000;
 static const unsigned long DISPLAY_MIN_INTERVAL_MS = 80;
+static const unsigned long DISPLAY_QUIET_PERIOD_MS = 30;
 static const unsigned long FEEDBACK_DURATION_MS    = 80;
+static const unsigned long PERSIST_DEBOUNCE_MS     = 2000;
+static const unsigned long WIFI_CONNECT_TIMEOUT_MS = 15000;
+static const unsigned long STATE_POLL_INTERVAL_MS  = 1000;
 
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 Preferences prefs;
@@ -48,13 +57,18 @@ unsigned long lastSensorEdgeMs = 0;
 int           peopleCount     = 0;
 int           busCapacity     = DEFAULT_BUS_CAPACITY;
 bool          paused          = false;
-unsigned long totalEntries    = 0;
-unsigned long totalExits      = 0;
-unsigned long discardedTotal  = 0;
+volatile int  pendingCapacity = DEFAULT_BUS_CAPACITY;
+volatile bool pendingPaused   = false;
+volatile long pendingResetToken   = -1;
+volatile long lastResetTokenSeen  = -1;
 
-bool          displayDirty    = true;
-unsigned long lastDisplayMs   = 0;
-int           lastShownCount  = -1;
+unsigned long totalEntries   = 0;
+unsigned long totalExits     = 0;
+unsigned long discardedTotal = 0;
+
+bool          displayDirty       = true;
+unsigned long lastDisplayMs      = 0;
+int           lastShownCount     = -1;
 char          lastShownLine1[17] = "";
 int           lastShownCapacity  = -1;
 
@@ -62,7 +76,20 @@ bool          feedbackActive  = false;
 bool          feedbackIsRed   = false;
 unsigned long feedbackStartMs = 0;
 
+int           lastPersistedCount = 0;
+unsigned long countChangedAt     = 0;
+
+struct PostJob { char eventType[12]; int count; unsigned long uptimeMs; };
+QueueHandle_t postQueue = nullptr;
+volatile bool wifiConnectedFlag = false;
+volatile unsigned long httpSuccessCount = 0;
+volatile unsigned long httpFailureCount = 0;
+
+String serverBase = "";
+
 const char* statusMessage() {
+  if (!wifiConnectedFlag)        return "Connecting...";
+  if (paused)                    return "Out of service";
   if (peopleCount >= busCapacity) return "Bus is full";
   if (busCapacity > 0 && peopleCount * 100 / busCapacity >= 80) return "Nearly full";
   return "Welcome aboard";
@@ -82,6 +109,7 @@ void refreshDisplay(bool force = false) {
   lastShownCount    = peopleCount;
   lastShownCapacity = busCapacity;
   strncpy(lastShownLine1, line1, sizeof(lastShownLine1));
+  lastShownLine1[sizeof(lastShownLine1) - 1] = '\0';
 }
 
 float readDistanceCm(uint8_t trig, uint8_t echo) {
@@ -109,6 +137,17 @@ void updateFeedback() {
   }
 }
 
+void enqueueEvent(const char* type) {
+  if (!postQueue) return;
+  PostJob job;
+  strncpy(job.eventType, type, sizeof(job.eventType) - 1);
+  job.eventType[sizeof(job.eventType) - 1] = '\0';
+  job.count    = peopleCount;
+  job.uptimeMs = millis();
+  if (xQueueSend(postQueue, &job, 0) != pdTRUE)
+    Serial.println("[NET] queue full, dropping event");
+}
+
 void updateSensor(Sensor& s) {
   s.distanceCm = readDistanceCm(s.trig, s.echo);
   unsigned long now = millis();
@@ -128,13 +167,38 @@ void updateSensor(Sensor& s) {
   }
 }
 
+void applyPendingControls() {
+  bool changed = false;
+  if ((int)pendingCapacity != busCapacity && pendingCapacity > 0 && pendingCapacity < 200) {
+    busCapacity = pendingCapacity;
+    prefs.putInt("cap", busCapacity);
+    changed = true;
+  }
+  if ((bool)pendingPaused != paused) {
+    paused = pendingPaused;
+    prefs.putBool("paused", paused);
+    changed = true;
+  }
+  if (pendingResetToken > lastResetTokenSeen) {
+    peopleCount = 0;
+    countChangedAt = millis();
+    lastResetTokenSeen = pendingResetToken;
+    prefs.putLong("reset_t", lastResetTokenSeen);
+    prefs.putInt("count", 0);
+    lastPersistedCount = 0;
+    changed = true;
+    enqueueEvent("reset");
+  }
+  if (changed) displayDirty = true;
+}
+
 void commitCount(bool isEntry) {
-  if (isEntry) { peopleCount++; totalEntries++; }
-  else { if (peopleCount > 0) peopleCount--; totalExits++; }
+  if (isEntry) { peopleCount++; totalEntries++; enqueueEvent("entry"); }
+  else { if (peopleCount > 0) peopleCount--; totalExits++; enqueueEvent("exit"); }
   Serial.printf(">>> %s  count=%d/%d\n",
                 isEntry ? "ENTRY" : "EXIT", peopleCount, busCapacity);
-  prefs.putInt("count", peopleCount);
-  displayDirty = true;
+  countChangedAt = millis();
+  displayDirty   = true;
   startFeedback(peopleCount >= busCapacity);
 }
 
@@ -151,7 +215,7 @@ void updatePassage() {
       if (a && !b)      firstBroken = 'A';
       else if (b && !a) firstBroken = 'B';
       else {
-        if (sensorA.lastRiseMs < sensorB.lastRiseMs) firstBroken = 'A';
+        if      (sensorA.lastRiseMs < sensorB.lastRiseMs) firstBroken = 'A';
         else if (sensorB.lastRiseMs < sensorA.lastRiseMs) firstBroken = 'B';
         else {
           float da = (sensorA.distanceCm > 0) ? sensorA.distanceCm : 9999.0f;
@@ -176,11 +240,11 @@ void updatePassage() {
 
         if (bothBeams && dirOk) {
           bool isEntry = (firstBroken == 'A' && lastCleared == 'B');
-          commitCount(isEntry);
+          if (paused) Serial.println("[paused] passage detected but not counted");
+          else commitCount(isEntry);
         } else if (!bothBeams) {
           discardedTotal++;
-          Serial.printf("[discard partial] only %s saw activity\n",
-            aSeenInPassage ? "A" : (bSeenInPassage ? "B" : "neither"));
+          Serial.printf("[discard partial] only %s\n", aSeenInPassage ? "A" : "B");
         } else {
           discardedTotal++;
           Serial.printf("[discard retreat] first=%c last=%c\n", firstBroken, lastCleared);
@@ -199,9 +263,104 @@ void updatePassage() {
   }
 }
 
+void maybePersistCount() {
+  if (peopleCount == lastPersistedCount) return;
+  if (millis() - countChangedAt < PERSIST_DEBOUNCE_MS) return;
+  prefs.putInt("count", peopleCount);
+  lastPersistedCount = peopleCount;
+}
+
+static void httpFireOne(const PostJob& job) {
+  HTTPClient http;
+  String url = serverBase + "/events";
+  if (!http.begin(url)) { httpFailureCount++; return; }
+  http.addHeader("Content-Type", "application/json");
+  http.setTimeout(4000);
+
+  String payload = String("{\"device\":\"") + DEVICE_ID
+                 + "\",\"event_type\":\"" + job.eventType
+                 + "\",\"count\":" + job.count
+                 + ",\"uptime_ms\":" + (unsigned long)job.uptimeMs + "}";
+
+  int code = http.POST(payload);
+  if (code >= 200 && code < 300) httpSuccessCount++;
+  else httpFailureCount++;
+  http.end();
+}
+
+static void pollDeviceState() {
+  HTTPClient http;
+  String url = serverBase + "/device/state?device_id=" + DEVICE_ID;
+  if (!http.begin(url)) return;
+  http.setTimeout(2500);
+  int code = http.GET();
+  if (code == 200) {
+    String body = http.getString();
+    int capIdx = body.indexOf("\"capacity\":");
+    int pauIdx = body.indexOf("\"paused\":");
+    int rstIdx = body.indexOf("\"reset_token\":");
+    if (capIdx >= 0) {
+      int s = capIdx + 11, e = body.indexOf(',', s);
+      if (e < 0) e = body.indexOf('}', s);
+      pendingCapacity = body.substring(s, e).toInt();
+    }
+    if (pauIdx >= 0) pendingPaused = (body.charAt(pauIdx + 9) == 't');
+    if (rstIdx >= 0) {
+      int s = rstIdx + 14, e = body.indexOf('}', s);
+      if (e < 0) e = body.length();
+      pendingResetToken = body.substring(s, e).toInt();
+    }
+  }
+  http.end();
+}
+
+static void wifiConnectBlocking() {
+  Serial.printf("[WIFI] connecting to \"%s\"\n", WIFI_SSID);
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(true, true);
+  vTaskDelay(pdMS_TO_TICKS(100));
+  WiFi.setSleep(false);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED) {
+    if (millis() - start > WIFI_CONNECT_TIMEOUT_MS) {
+      WiFi.disconnect(true, true);
+      vTaskDelay(pdMS_TO_TICKS(3000));
+      WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+      start = millis();
+    }
+    vTaskDelay(pdMS_TO_TICKS(200));
+  }
+  Serial.printf("[WIFI] connected! IP=%s\n", WiFi.localIP().toString().c_str());
+  wifiConnectedFlag = true;
+  serverBase = String("http://") + FALLBACK_SERVER_IP + ":" + SERVER_PORT;
+}
+
+void networkTask(void* /*arg*/) {
+  wifiConnectBlocking();
+  unsigned long lastStatePoll = 0;
+
+  for (;;) {
+    if (WiFi.status() != WL_CONNECTED) {
+      wifiConnectedFlag = false;
+      wifiConnectBlocking();
+    }
+
+    PostJob job;
+    if (xQueueReceive(postQueue, &job, pdMS_TO_TICKS(200)) == pdTRUE)
+      httpFireOne(job);
+
+    if (millis() - lastStatePoll >= STATE_POLL_INTERVAL_MS) {
+      lastStatePoll = millis();
+      pollDeviceState();
+    }
+  }
+}
+
 void setup() {
   Serial.begin(115200); delay(80);
-  Serial.println("[BOOT] Bus Counter v2");
+  Serial.println("[BOOT] Bus Counter v3");
 
   pinMode(SENSOR_A_TRIG, OUTPUT); pinMode(SENSOR_A_ECHO, INPUT);
   pinMode(SENSOR_B_TRIG, OUTPUT); pinMode(SENSOR_B_ECHO, INPUT);
@@ -210,17 +369,27 @@ void setup() {
   digitalWrite(BUZZER, LOW);
 
   prefs.begin("buscount", false);
-  peopleCount = prefs.getInt("count", 0);
+  peopleCount        = prefs.getInt("count", 0);
   if (peopleCount < 0 || peopleCount > 100) peopleCount = 0;
-  busCapacity = prefs.getInt("cap", DEFAULT_BUS_CAPACITY);
+  lastPersistedCount = peopleCount;
+  busCapacity        = prefs.getInt("cap", DEFAULT_BUS_CAPACITY);
+  paused             = prefs.getBool("paused", false);
+  lastResetTokenSeen = prefs.getLong("reset_t", -1);
+  pendingCapacity    = busCapacity;
+  pendingPaused      = paused;
+  pendingResetToken  = lastResetTokenSeen;
 
   lcd.init(); lcd.backlight(); lcd.clear();
   lcd.setCursor(0, 0); lcd.print("Bus Counter");
-  lcd.setCursor(0, 1); lcd.print("Starting...");
+  lcd.setCursor(0, 1); lcd.print("Starting up...");
   delay(700);
 
   refreshDisplay(true);
-  Serial.printf("[BOOT] count=%d cap=%d\n", peopleCount, busCapacity);
+  Serial.printf("[BOOT] count=%d cap=%d paused=%d\n", peopleCount, busCapacity, paused ? 1 : 0);
+
+  postQueue = xQueueCreate(16, sizeof(PostJob));
+  xTaskCreatePinnedToCore(networkTask, "networkTask", 8192, nullptr, 1, nullptr, 0);
+  enqueueEvent("boot");
 }
 
 void loop() {
@@ -228,6 +397,7 @@ void loop() {
   unsigned long now = millis();
 
   updateFeedback();
+  if (passageState == WAITING) applyPendingControls();
 
   if (now - lastSampleMs >= SAMPLE_INTERVAL_MS) {
     lastSampleMs = now;
@@ -238,21 +408,15 @@ void loop() {
     return;
   }
 
-  if (displayDirty
-      && passageState == WAITING
-      && (now - lastSensorEdgeMs) > 30
+  if (displayDirty && passageState == WAITING
+      && (now - lastSensorEdgeMs) > DISPLAY_QUIET_PERIOD_MS
       && (now - lastDisplayMs) > DISPLAY_MIN_INTERVAL_MS) {
     refreshDisplay();
-    displayDirty  = false;
-    lastDisplayMs = millis();
+    displayDirty = false; lastDisplayMs = millis();
   }
 
-  static unsigned long lastDebug = 0;
-  if (now - lastDebug > 250) {
-    lastDebug = now;
-    Serial.printf("A:%s %.1fcm | B:%s %.1fcm | count:%d/%d in:%lu out:%lu disc:%lu\n",
-      sensorA.active ? "ON " : "off", sensorA.distanceCm,
-      sensorB.active ? "ON " : "off", sensorB.distanceCm,
-      peopleCount, busCapacity, totalEntries, totalExits, discardedTotal);
-  }
+  static unsigned long lastForced = 0;
+  if (now - lastForced > 1000) { lastForced = now; displayDirty = true; }
+
+  maybePersistCount();
 }
