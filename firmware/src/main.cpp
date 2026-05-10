@@ -4,10 +4,14 @@
 #include <Preferences.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <ESPmDNS.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "config.h"
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+Preferences prefs;
 
 #define SENSOR_A_TRIG  17
 #define SENSOR_A_ECHO  16
@@ -22,49 +26,47 @@ static const float DETECT_DIST_CM            = 50.0f;
 static const float CLEAR_DIST_CM             = 65.0f;
 static const int   DETECT_CONFIRM_READS      = 2;
 static const int   CLEAR_CONFIRM_READS       = 2;
-static const unsigned long SAMPLE_INTERVAL_MS      = 18;
-static const unsigned long INTER_SENSOR_GAP_US     = 1500;
-static const unsigned long PULSE_TIMEOUT_US        = 5000;
-static const unsigned long PASSAGE_MAX_DURATION_MS = 5000;
-static const unsigned long DISPLAY_MIN_INTERVAL_MS = 80;
-static const unsigned long DISPLAY_QUIET_PERIOD_MS = 30;
-static const unsigned long FEEDBACK_DURATION_MS    = 80;
-static const unsigned long PERSIST_DEBOUNCE_MS     = 2000;
-static const unsigned long WIFI_CONNECT_TIMEOUT_MS = 15000;
-static const unsigned long STATE_POLL_INTERVAL_MS  = 1000;
+static const unsigned long SAMPLE_INTERVAL_MS       = 18;
+static const unsigned long INTER_SENSOR_GAP_US      = 1500;
+static const unsigned long PULSE_TIMEOUT_US         = 5000;
+static const unsigned long PASSAGE_MAX_DURATION_MS  = 5000;
+static const unsigned long SENSOR_FAULT_TIMEOUT_MS  = 6000;
+static const unsigned long DISPLAY_MIN_INTERVAL_MS  = 80;
+static const unsigned long DISPLAY_QUIET_PERIOD_MS  = 30;
+static const unsigned long FEEDBACK_DURATION_MS     = 80;
+static const unsigned long PERSIST_DEBOUNCE_MS      = 2000;
+static const unsigned long WIFI_CONNECT_TIMEOUT_MS  = 15000;
+static const unsigned long WIFI_RETRY_BACKOFF_MS    = 5000;
+static const unsigned long STATE_POLL_INTERVAL_MS   = 1000;
 
-LiquidCrystal_I2C lcd(0x27, 16, 2);
-Preferences prefs;
+String serverBase = "";
 
 struct Sensor {
-  uint8_t trig; uint8_t echo; const char* name;
-  float distanceCm; bool active;
-  int detectCount; int clearCount;
+  uint8_t       trig; uint8_t echo; const char* name;
+  float         distanceCm; bool active; int detectCount; int clearCount;
   unsigned long lastRiseMs; unsigned long lastFallMs;
+  unsigned long lastValidReadMs; bool faulted;
 };
 
-Sensor sensorA = {SENSOR_A_TRIG, SENSOR_A_ECHO, "A", -1.0f, false, 0, 0, 0, 0};
-Sensor sensorB = {SENSOR_B_TRIG, SENSOR_B_ECHO, "B", -1.0f, false, 0, 0, 0, 0};
+Sensor sensorA = {SENSOR_A_TRIG, SENSOR_A_ECHO, "A", -1.0f, false, 0, 0, 0, 0, 0, false};
+Sensor sensorB = {SENSOR_B_TRIG, SENSOR_B_ECHO, "B", -1.0f, false, 0, 0, 0, 0, 0, false};
 
 enum PassageState { WAITING, TRACKING };
-PassageState  passageState    = WAITING;
-char          firstBroken     = 0;
-bool          aSeenInPassage  = false;
-bool          bSeenInPassage  = false;
-unsigned long passageStartMs  = 0;
+PassageState  passageState     = WAITING;
+char          firstBroken      = 0;
+bool          aSeenInPassage   = false;
+bool          bSeenInPassage   = false;
+unsigned long passageStartMs   = 0;
 unsigned long lastSensorEdgeMs = 0;
 
-int           peopleCount     = 0;
-int           busCapacity     = DEFAULT_BUS_CAPACITY;
-bool          paused          = false;
-volatile int  pendingCapacity = DEFAULT_BUS_CAPACITY;
-volatile bool pendingPaused   = false;
-volatile long pendingResetToken   = -1;
-volatile long lastResetTokenSeen  = -1;
+int  peopleCount = 0;
+int  busCapacity = DEFAULT_BUS_CAPACITY;
+bool paused      = false;
 
-unsigned long totalEntries   = 0;
-unsigned long totalExits     = 0;
-unsigned long discardedTotal = 0;
+volatile long lastResetTokenSeen = -1;
+volatile int  pendingCapacity    = DEFAULT_BUS_CAPACITY;
+volatile bool pendingPaused      = false;
+volatile long pendingResetToken  = -1;
 
 bool          displayDirty       = true;
 unsigned long lastDisplayMs      = 0;
@@ -79,17 +81,24 @@ unsigned long feedbackStartMs = 0;
 int           lastPersistedCount = 0;
 unsigned long countChangedAt     = 0;
 
-struct PostJob { char eventType[12]; int count; unsigned long uptimeMs; };
-QueueHandle_t postQueue = nullptr;
-volatile bool wifiConnectedFlag = false;
-volatile unsigned long httpSuccessCount = 0;
-volatile unsigned long httpFailureCount = 0;
+unsigned long totalEntries      = 0;
+unsigned long totalExits        = 0;
+unsigned long discardedRetreats = 0;
+unsigned long discardedPartials = 0;
+unsigned long discardedTimeouts = 0;
 
-String serverBase = "";
+struct PostJob { char eventType[12]; int count; unsigned long uptimeMs; };
+QueueHandle_t  postQueue          = nullptr;
+TaskHandle_t   networkTaskHandle  = nullptr;
+volatile unsigned long httpSuccessCount  = 0;
+volatile unsigned long httpFailureCount  = 0;
+volatile bool          wifiConnectedFlag = false;
 
 const char* statusMessage() {
-  if (!wifiConnectedFlag)        return "Connecting...";
-  if (paused)                    return "Out of service";
+  bool fault = (sensorA.faulted || sensorB.faulted);
+  if (!wifiConnectedFlag) return "Connecting...";
+  if (fault)              return "Please wait...";
+  if (paused)             return "Out of service";
   if (peopleCount >= busCapacity) return "Bus is full";
   if (busCapacity > 0 && peopleCount * 100 / busCapacity >= 80) return "Nearly full";
   return "Welcome aboard";
@@ -112,6 +121,11 @@ void refreshDisplay(bool force = false) {
   lastShownLine1[sizeof(lastShownLine1) - 1] = '\0';
 }
 
+void setIdleLEDs() {
+  if (peopleCount >= busCapacity) { digitalWrite(RED_LED, HIGH); digitalWrite(GREEN_LED, LOW); }
+  else                            { digitalWrite(RED_LED, LOW);  digitalWrite(GREEN_LED, HIGH); }
+}
+
 float readDistanceCm(uint8_t trig, uint8_t echo) {
   digitalWrite(trig, LOW); delayMicroseconds(2);
   digitalWrite(trig, HIGH); delayMicroseconds(10); digitalWrite(trig, LOW);
@@ -132,8 +146,7 @@ void updateFeedback() {
   if (millis() - feedbackStartMs >= FEEDBACK_DURATION_MS) {
     feedbackActive = false;
     digitalWrite(BUZZER, LOW);
-    digitalWrite(GREEN_LED, peopleCount >= busCapacity ? LOW : HIGH);
-    digitalWrite(RED_LED,   peopleCount >= busCapacity ? HIGH : LOW);
+    setIdleLEDs();
   }
 }
 
@@ -151,6 +164,15 @@ void enqueueEvent(const char* type) {
 void updateSensor(Sensor& s) {
   s.distanceCm = readDistanceCm(s.trig, s.echo);
   unsigned long now = millis();
+
+  if (s.distanceCm > 0.0f) {
+    s.lastValidReadMs = now;
+    if (s.faulted) { s.faulted = false; displayDirty = true;
+      Serial.printf("Sensor %s recovered.\n", s.name); }
+  } else if (now - s.lastValidReadMs > SENSOR_FAULT_TIMEOUT_MS) {
+    if (!s.faulted) { s.faulted = true; displayDirty = true;
+      Serial.printf("[WARNING] Sensor %s not responding.\n", s.name); }
+  }
 
   bool inDetect = (s.distanceCm > 0.0f && s.distanceCm <= DETECT_DIST_CM);
   bool inClear  = (s.distanceCm < 0.0f || s.distanceCm >= CLEAR_DIST_CM);
@@ -170,24 +192,20 @@ void updateSensor(Sensor& s) {
 void applyPendingControls() {
   bool changed = false;
   if ((int)pendingCapacity != busCapacity && pendingCapacity > 0 && pendingCapacity < 200) {
-    busCapacity = pendingCapacity;
-    prefs.putInt("cap", busCapacity);
-    changed = true;
+    busCapacity = pendingCapacity; prefs.putInt("cap", busCapacity);
+    Serial.printf("[control] capacity -> %d\n", busCapacity); changed = true;
   }
   if ((bool)pendingPaused != paused) {
-    paused = pendingPaused;
-    prefs.putBool("paused", paused);
-    changed = true;
+    paused = pendingPaused; prefs.putBool("paused", paused);
+    Serial.printf("[control] paused -> %d\n", paused ? 1 : 0); changed = true;
   }
   if (pendingResetToken > lastResetTokenSeen) {
-    peopleCount = 0;
-    countChangedAt = millis();
+    peopleCount = 0; countChangedAt = millis();
     lastResetTokenSeen = pendingResetToken;
     prefs.putLong("reset_t", lastResetTokenSeen);
-    prefs.putInt("count", 0);
-    lastPersistedCount = 0;
-    changed = true;
-    enqueueEvent("reset");
+    prefs.putInt("count", 0); lastPersistedCount = 0;
+    Serial.printf("[control] reset (token=%ld)\n", lastResetTokenSeen);
+    changed = true; enqueueEvent("reset");
   }
   if (changed) displayDirty = true;
 }
@@ -195,8 +213,8 @@ void applyPendingControls() {
 void commitCount(bool isEntry) {
   if (isEntry) { peopleCount++; totalEntries++; enqueueEvent("entry"); }
   else { if (peopleCount > 0) peopleCount--; totalExits++; enqueueEvent("exit"); }
-  Serial.printf(">>> %s  count=%d/%d\n",
-                isEntry ? "ENTRY" : "EXIT", peopleCount, busCapacity);
+  Serial.printf(">>> %s  count=%d (in=%lu out=%lu)\n",
+                isEntry ? "ENTRY" : "EXIT", peopleCount, totalEntries, totalExits);
   countChangedAt = millis();
   displayDirty   = true;
   startFeedback(peopleCount >= busCapacity);
@@ -240,13 +258,14 @@ void updatePassage() {
 
         if (bothBeams && dirOk) {
           bool isEntry = (firstBroken == 'A' && lastCleared == 'B');
-          if (paused) Serial.println("[paused] passage detected but not counted");
+          if (paused) Serial.println("[paused] passage not counted");
           else commitCount(isEntry);
         } else if (!bothBeams) {
-          discardedTotal++;
-          Serial.printf("[discard partial] only %s\n", aSeenInPassage ? "A" : "B");
+          discardedPartials++;
+          Serial.printf("[discard partial] only %s saw activity\n",
+            aSeenInPassage ? "A" : (bSeenInPassage ? "B" : "neither"));
         } else {
-          discardedTotal++;
+          discardedRetreats++;
           Serial.printf("[discard retreat] first=%c last=%c\n", firstBroken, lastCleared);
         }
         passageState = WAITING;
@@ -254,7 +273,7 @@ void updatePassage() {
         return;
       }
       if (now - passageStartMs > PASSAGE_MAX_DURATION_MS) {
-        discardedTotal++;
+        discardedTimeouts++;
         Serial.println("[discard timeout]");
         passageState = WAITING;
         firstBroken = 0; aSeenInPassage = false; bSeenInPassage = false;
@@ -268,6 +287,7 @@ void maybePersistCount() {
   if (millis() - countChangedAt < PERSIST_DEBOUNCE_MS) return;
   prefs.putInt("count", peopleCount);
   lastPersistedCount = peopleCount;
+  Serial.printf("[persist] count=%d saved\n", peopleCount);
 }
 
 static void httpFireOne(const PostJob& job) {
@@ -276,12 +296,11 @@ static void httpFireOne(const PostJob& job) {
   if (!http.begin(url)) { httpFailureCount++; return; }
   http.addHeader("Content-Type", "application/json");
   http.setTimeout(4000);
-
   String payload = String("{\"device\":\"") + DEVICE_ID
                  + "\",\"event_type\":\"" + job.eventType
                  + "\",\"count\":" + job.count
                  + ",\"uptime_ms\":" + (unsigned long)job.uptimeMs + "}";
-
+  Serial.printf("[HTTP] POST %s  %s\n", url.c_str(), payload.c_str());
   int code = http.POST(payload);
   if (code >= 200 && code < 300) httpSuccessCount++;
   else httpFailureCount++;
@@ -314,6 +333,28 @@ static void pollDeviceState() {
   http.end();
 }
 
+void resolveServerBase() {
+  Serial.printf("[mDNS] looking up %s.local...\n", MDNS_HOST);
+  if (!MDNS.begin("buscounter-esp32")) {
+    Serial.println("[mDNS] init failed, using fallback IP");
+    serverBase = String("http://") + FALLBACK_SERVER_IP + ":" + SERVER_PORT;
+    return;
+  }
+  IPAddress ip;
+  for (int i = 1; i <= 3; i++) {
+    ip = MDNS.queryHost(MDNS_HOST, 2000);
+    if (ip != IPAddress(0, 0, 0, 0)) {
+      serverBase = String("http://") + ip.toString() + ":" + SERVER_PORT;
+      Serial.printf("[mDNS] resolved -> %s\n", ip.toString().c_str());
+      return;
+    }
+    Serial.printf("[mDNS] attempt %d failed\n", i);
+    vTaskDelay(pdMS_TO_TICKS(500));
+  }
+  Serial.printf("[mDNS] giving up, fallback: %s\n", FALLBACK_SERVER_IP);
+  serverBase = String("http://") + FALLBACK_SERVER_IP + ":" + SERVER_PORT;
+}
+
 static void wifiConnectBlocking() {
   Serial.printf("[WIFI] connecting to \"%s\"\n", WIFI_SSID);
   WiFi.mode(WIFI_STA);
@@ -325,32 +366,35 @@ static void wifiConnectBlocking() {
   unsigned long start = millis();
   while (WiFi.status() != WL_CONNECTED) {
     if (millis() - start > WIFI_CONNECT_TIMEOUT_MS) {
+      Serial.println("[WIFI] timeout, retrying...");
       WiFi.disconnect(true, true);
-      vTaskDelay(pdMS_TO_TICKS(3000));
+      vTaskDelay(pdMS_TO_TICKS(WIFI_RETRY_BACKOFF_MS));
       WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
       start = millis();
     }
     vTaskDelay(pdMS_TO_TICKS(200));
   }
-  Serial.printf("[WIFI] connected! IP=%s\n", WiFi.localIP().toString().c_str());
+  Serial.printf("[WIFI] connected! IP=%s RSSI=%d\n",
+                WiFi.localIP().toString().c_str(), WiFi.RSSI());
   wifiConnectedFlag = true;
-  serverBase = String("http://") + FALLBACK_SERVER_IP + ":" + SERVER_PORT;
 }
 
 void networkTask(void* /*arg*/) {
+  Serial.printf("[NET] task on core %d\n", xPortGetCoreID());
   wifiConnectBlocking();
-  unsigned long lastStatePoll = 0;
+  resolveServerBase();
 
+  unsigned long lastStatePoll = 0;
   for (;;) {
     if (WiFi.status() != WL_CONNECTED) {
       wifiConnectedFlag = false;
+      Serial.println("[WIFI] lost connection, reconnecting...");
       wifiConnectBlocking();
+      resolveServerBase();
     }
-
     PostJob job;
     if (xQueueReceive(postQueue, &job, pdMS_TO_TICKS(200)) == pdTRUE)
       httpFireOne(job);
-
     if (millis() - lastStatePoll >= STATE_POLL_INTERVAL_MS) {
       lastStatePoll = millis();
       pollDeviceState();
@@ -360,7 +404,9 @@ void networkTask(void* /*arg*/) {
 
 void setup() {
   Serial.begin(115200); delay(80);
-  Serial.println("[BOOT] Bus Counter v3");
+  Serial.println("============================================");
+  Serial.println("[BOOT] Bus Counter v3 final");
+  Serial.println("============================================");
 
   pinMode(SENSOR_A_TRIG, OUTPUT); pinMode(SENSOR_A_ECHO, INPUT);
   pinMode(SENSOR_B_TRIG, OUTPUT); pinMode(SENSOR_B_ECHO, INPUT);
@@ -379,16 +425,22 @@ void setup() {
   pendingPaused      = paused;
   pendingResetToken  = lastResetTokenSeen;
 
+  unsigned long now = millis();
+  sensorA.lastValidReadMs = now;
+  sensorB.lastValidReadMs = now;
+
   lcd.init(); lcd.backlight(); lcd.clear();
   lcd.setCursor(0, 0); lcd.print("Bus Counter");
   lcd.setCursor(0, 1); lcd.print("Starting up...");
   delay(700);
 
   refreshDisplay(true);
+  setIdleLEDs();
   Serial.printf("[BOOT] count=%d cap=%d paused=%d\n", peopleCount, busCapacity, paused ? 1 : 0);
 
   postQueue = xQueueCreate(16, sizeof(PostJob));
-  xTaskCreatePinnedToCore(networkTask, "networkTask", 8192, nullptr, 1, nullptr, 0);
+  xTaskCreatePinnedToCore(networkTask, "networkTask", 8192, nullptr, 1, &networkTaskHandle, 0);
+  Serial.println("[BOOT] Network task started on core 0.");
   enqueueEvent("boot");
 }
 
@@ -419,4 +471,18 @@ void loop() {
   if (now - lastForced > 1000) { lastForced = now; displayDirty = true; }
 
   maybePersistCount();
+
+  static unsigned long lastDebug = 0;
+  if (now - lastDebug > 250) {
+    lastDebug = now;
+    Serial.printf("A:%s %5.1fcm | B:%s %5.1fcm | st:%d cnt:%d/%d %s | in:%lu out:%lu drops:%lu/%lu/%lu | wifi:%s http:%lu/%lu\n",
+      sensorA.active ? "ON " : "off", sensorA.distanceCm,
+      sensorB.active ? "ON " : "off", sensorB.distanceCm,
+      (int)passageState, peopleCount, busCapacity,
+      paused ? "PAUSED" : "      ",
+      totalEntries, totalExits,
+      discardedRetreats, discardedPartials, discardedTimeouts,
+      wifiConnectedFlag ? "UP" : "down",
+      httpSuccessCount, httpFailureCount);
+  }
 }
