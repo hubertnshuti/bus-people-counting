@@ -2,6 +2,7 @@ import streamlit as st
 import sqlite3
 import pandas as pd
 import os
+import time
 import requests
 
 st.set_page_config(page_title="Bus Counter", page_icon="🚌", layout="wide")
@@ -22,7 +23,7 @@ def load_events():
     return df
 
 
-def get_device_state():
+def get_device_state_fresh():
     try:
         r = requests.get(f"{SERVER_BASE}/device/state", timeout=2)
         if r.ok:
@@ -32,56 +33,87 @@ def get_device_state():
     return {"capacity": 10, "paused": False, "reset_token": 0}
 
 
+def get_device_state_cached():
+    now = time.time()
+    if "state_cached" not in st.session_state or \
+       now - st.session_state.get("state_cached_at", 0) > 5:
+        st.session_state.state_cached = get_device_state_fresh()
+        st.session_state.state_cached_at = now
+    return st.session_state.state_cached
+
+
 def update_device_state(payload):
     try:
         r = requests.post(f"{SERVER_BASE}/device/state", json=payload, timeout=2)
+        st.session_state.state_cached_at = 0
         return r.ok
     except Exception:
         return False
 
 
-state   = get_device_state()
-bus_cap = int(state["capacity"])
-
-# Sidebar controls
+# Sidebar
+state = get_device_state_fresh()
 with st.sidebar:
     st.markdown("### Controls")
-    new_cap = st.slider("Bus capacity", 2, 50, bus_cap)
-    if new_cap != bus_cap:
+    st.caption("Changes reach the device within ~1 second.")
+    new_cap = st.slider("Bus capacity", 2, 50, int(state["capacity"]))
+    if new_cap != int(state["capacity"]):
         update_device_state({"capacity": new_cap})
-
     new_paused = st.toggle("Pause counting", value=bool(state["paused"]))
     if new_paused != bool(state["paused"]):
         update_device_state({"paused": new_paused})
-
-    if st.button("Reset count to zero", type="primary"):
+    if st.button("Reset count to zero", type="primary", width="stretch"):
         if update_device_state({"do_reset": True}):
-            st.toast("Reset sent")
+            st.toast("Reset signal sent to device")
+    st.divider()
+    st.caption(f"Capacity: {state['capacity']}")
+    st.caption(f"Paused: {'yes' if state['paused'] else 'no'}")
 
-# Main content
 st.title("Bus Counter")
-st.caption("Real-time passenger monitoring")
+st.caption("Real-time passenger monitoring with predictive overcrowding alerts")
+st.subheader("Live status")
 
-df = load_events()
-live = df[df["device_id"] == "bus01"].copy() if not df.empty else pd.DataFrame()
 
-if live.empty:
-    current_count = 0
-    total_entries = 0
-    total_exits   = 0
-else:
-    current_count = int(live.iloc[-1]["count_after"])
-    total_entries = int((live["event_type"] == "entry").sum())
-    total_exits   = int((live["event_type"] == "exit").sum())
+@st.fragment(run_every=1)
+def live_metrics():
+    state   = get_device_state_cached()
+    bus_cap = int(state["capacity"])
+    df      = load_events()
+    live    = df[df["device_id"] == "bus01"].copy() if not df.empty else pd.DataFrame()
 
-col1, col2, col3 = st.columns(3)
-with col1: st.metric("People on bus", f"{current_count} / {bus_cap}")
-with col2: st.metric("Total entries", total_entries)
-with col3: st.metric("Total exits", total_exits)
+    if live.empty:
+        current_count, total_entries, total_exits, seconds_since = 0, 0, 0, 999
+    else:
+        current_count  = int(live.iloc[-1]["count_after"])
+        total_entries  = int((live["event_type"] == "entry").sum())
+        total_exits    = int((live["event_type"] == "exit").sum())
+        seconds_since  = (pd.Timestamp.now() - live.iloc[-1]["server_time"]).total_seconds()
 
-st.subheader("Recent events")
-if not live.empty:
-    recent = live.tail(10).iloc[::-1][["server_time", "event_type", "count_after"]]
-    st.dataframe(recent, hide_index=True)
-else:
-    st.info("No events yet.")
+    col1, col2, col3, col4 = st.columns(4)
+    with col1: st.metric("People on bus", f"{current_count} / {bus_cap}")
+    with col2: st.metric("Total entries", total_entries)
+    with col3: st.metric("Total exits", total_exits)
+    with col4:
+        if seconds_since < 30:    status = "Online"
+        elif seconds_since < 120: status = "Quiet"
+        else:                     status = "No signal"
+        st.metric("Device", status, f"{int(seconds_since)}s ago")
+
+
+@st.fragment(run_every=5)
+def recent_events_fragment():
+    df = load_events()
+    if df.empty:
+        return
+    live = df[df["device_id"] == "bus01"].copy()
+    if live.empty:
+        return
+    st.divider()
+    st.subheader("Recent events")
+    recent = live.tail(15).iloc[::-1][["server_time", "event_type", "count_after"]]
+    recent.columns = ["Time", "Event", "Count after"]
+    st.dataframe(recent, width="stretch", hide_index=True)
+
+
+live_metrics()
+recent_events_fragment()
