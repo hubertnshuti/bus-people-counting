@@ -10,8 +10,11 @@ from sklearn.linear_model import LinearRegression
 
 st.set_page_config(page_title="Bus Counter", page_icon="🚌", layout="wide")
 
-DB_PATH       = os.path.join(os.path.dirname(__file__), "..", "backend", "data", "bus.db")
-SERVER_BASE   = "http://localhost:8000"
+DB_PATH     = os.environ.get(
+    "BUS_DB_PATH",
+    os.path.join(os.path.dirname(__file__), "..", "backend", "data", "bus.db"),
+)
+SERVER_BASE = os.environ.get("SERVER_BASE", "http://localhost:8000")
 DISPLAY_HOURS = list(range(5, 23))
 WEEKDAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 

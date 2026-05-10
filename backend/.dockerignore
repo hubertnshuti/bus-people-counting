@@ -1,0 +1,10 @@
+# .dockerignore works exactly like .gitignore but for Docker builds.
+# Files listed here are NOT sent to the Docker build context — keeps
+# the image lean and prevents secrets from sneaking in.
+__pycache__/
+*.py[cod]
+.env
+data/*.db
+tests/
+requirements-dev.txt
+.pytest_cache/
