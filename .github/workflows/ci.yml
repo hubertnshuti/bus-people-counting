@@ -1,0 +1,65 @@
+# CI — Continuous Integration
+#
+# Every push to dev or main, and every pull request targeting main,
+# triggers this workflow automatically on GitHub's servers.
+# If any step fails, GitHub marks the commit/PR with a red X.
+# You catch bugs before they reach main.
+
+name: CI
+
+on:
+  push:
+    branches: [dev, main]
+  pull_request:
+    branches: [main]
+
+jobs:
+
+  # ── Job 1: run the test suite ─────────────────────────────────────
+  test:
+    name: Backend tests
+    runs-on: ubuntu-latest   # GitHub spins up a fresh Ubuntu VM for this
+
+    steps:
+      # 1. Download the repo code into the VM
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # 2. Install Python
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip                              # caches pip downloads between runs
+          cache-dependency-path: backend/requirements-dev.txt
+
+      # 3. Install dependencies (prod + test tools)
+      - name: Install dependencies
+        run: pip install -r backend/requirements-dev.txt
+
+      # 4. Run pytest — if any test fails, this step fails and the whole job fails
+      - name: Run tests
+        run: python -m pytest backend/tests/ -v --tb=short
+
+  # ── Job 2: lint the code ───────────────────────────────────────────
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ruff
+        run: pip install ruff
+
+      # ruff is a very fast Python linter — catches style issues and
+      # common bugs (unused imports, undefined names, etc.)
+      - name: Check backend
+        run: ruff check backend/app/
+
+      - name: Check dashboard
+        run: ruff check dashboard/app.py

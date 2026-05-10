@@ -1,0 +1,42 @@
+# docker-compose.yml — runs the whole stack with: docker compose up
+#
+# How containers talk to each other:
+#   Inside Docker, containers are on a private network.
+#   The service name (e.g. "backend") acts as a hostname — so the
+#   dashboard reaches the backend at http://backend:8000, not localhost.
+#
+# Volumes:
+#   bus_data is a named Docker volume shared between backend and dashboard.
+#   Both mount it, so they read/write the same bus.db file.
+#   The data persists even if you stop/restart the containers.
+
+services:
+
+  backend:
+    build:
+      context: ./backend
+    ports:
+      - "8000:8000"         # host:container — visit localhost:8000 on your machine
+    volumes:
+      - bus_data:/app/data  # mount the shared volume at /app/data inside the container
+    environment:
+      - BUS_DB_PATH=/app/data/bus.db
+    restart: unless-stopped
+
+  dashboard:
+    build:
+      context: ./dashboard
+    ports:
+      - "8501:8501"
+    volumes:
+      - bus_data:/data      # same volume, different mount path inside this container
+    environment:
+      - BUS_DB_PATH=/data/bus.db
+      - SERVER_BASE=http://backend:8000   # 'backend' resolves to the backend container
+    depends_on:
+      - backend             # Docker starts backend first, then dashboard
+    restart: unless-stopped
+
+volumes:
+  bus_data:
+    # named volume — Docker manages it, data survives container restarts
