@@ -150,6 +150,21 @@ void updateFeedback() {
   }
 }
 
+
+// Distinct triple-buzz alert when the bus reaches capacity.
+// Blocking (~900ms) but only fires the instant the bus fills, so it
+// won't disrupt normal counting.
+void capacityAlarm() {
+  digitalWrite(GREEN_LED, LOW);
+  digitalWrite(RED_LED, HIGH);
+  for (int i = 0; i < 3; i++) {
+    digitalWrite(BUZZER, HIGH);
+    delay(200);
+    digitalWrite(BUZZER, LOW);
+    delay(100);
+  }
+}
+
 void enqueueEvent(const char* type) {
   if (!postQueue) return;
   PostJob job;
@@ -217,7 +232,11 @@ void commitCount(bool isEntry) {
                 isEntry ? "ENTRY" : "EXIT", peopleCount, totalEntries, totalExits);
   countChangedAt = millis();
   displayDirty   = true;
-  startFeedback(peopleCount >= busCapacity);
+  if (isEntry && peopleCount >= busCapacity) {
+    capacityAlarm();          // triple buzz when bus becomes full
+  } else {
+    startFeedback(peopleCount >= busCapacity);  // normal short beep
+  }
 }
 
 void updatePassage() {

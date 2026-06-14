@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(Test-Path \"C:\\\\Users\\\\user\\\\Documents\\\\Bus People Counting\"; if \\($?\\) { Get-ChildItem -Path \"C:\\\\Users\\\\user\\\\Documents\\\\Bus People Counting\" -Recurse | ForEach-Object { $_.FullName } })",
+      "PowerShell(git *)",
+      "Bash(gh pr create --title 'feat: full project structure, firmware, backend and dashboard' --body ' *)",
+      "PowerShell(New-Item *)"
+    ]
+  }
+}

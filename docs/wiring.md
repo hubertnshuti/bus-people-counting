@@ -71,4 +71,4 @@ A person alighting breaks Sensor B first, then A. Direction is determined by whi
 
 ## Power
 
-The ESP32 and sensors run off USB 5V during development. For permanent installation use a 5V 2A regulated supply — the ESP32 WiFi radio draws up to 500 mA on transmit bursts.
+The ESP32 and sensors run off USB 5V during development. For permanent installation we'll use a 5V 2A regulated supply — the ESP32 WiFi radio draws up to 500 mA on transmit bursts.
